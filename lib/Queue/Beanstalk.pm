@@ -1,6 +1,6 @@
 package Queue::Beanstalk;
 
-use 5.008008;
+use 5.006002;
 use Carp;
 use Socket qw( MSG_NOSIGNAL PF_INET PF_UNIX IPPROTO_TCP SOCK_STREAM );
 use IO::Handle ();
@@ -15,7 +15,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw();
 our @EXPORT = qw();
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 our $FLAG_NOSIGNAL = 0;
 eval { $FLAG_NOSIGNAL = MSG_NOSIGNAL; };
@@ -34,11 +34,20 @@ sub new {
 		'servers' => [ '127.0.0.1:11300' ],
 
 		# Internals
+		'errstr' => '',
+		'warnstr' => '',
+		'_connect_retries' => 0,
 		'sock' => undef,
 	};
 
 	my $args = (@_ == 1) ? shift : { @_ }; # hashref-ify args
+
+	# Default: Retry one for each server (problems with connecting will do a
+	# round robin connect for this many times.)
+	$self->{'max_autoretry'} = scalar(@{$args->{'servers'}||$self->{'servers'}});
+
 	$self->{$_} = $args->{$_} foreach (keys %$args); # update options
+
 
 	bless $self, $classname;
 
@@ -48,11 +57,23 @@ sub new {
 	$self;
 }
 
-# TODO: Make sure next_server counts how many times it has
-# been run forcibly by an error, to prevent connect-loops.
+sub warn {
+	my ($self, $message) = @_;
+	$self->{'warnstr'} = $message;
+	carp $message if ($self->{'report_errors'});
+}
+
+sub die {
+	my ($self, $message) = @_;
+	$self->{'errstr'} = $message;
+	croak $message if ($self->{'report_errors'});
+}
+
 sub next_server {
 	my $self = shift;
-	if ($self->{'random_servers'}) {
+	my $internal = shift || 0;
+
+	if ($self->{'random_servers'} && !$internal) {
 		# get random server
 		$self->{'current_server'} = int( rand( scalar(@{$self->{'servers'}}) ) );
 	} else {
@@ -66,9 +87,14 @@ sub next_server {
 		}
 	}
 
-	unless ($self->connect()) {
-		croak('Could not connect to ' . @{$self->{'servers'}}[ $self->{'current_server'} ]);
+	# In case of connection errors or if all servers is in "draining mode",
+	# reconnect only this many times
+	# NOTE: Will try to reconnect 'for ever' if no servers responds
+	# and report_errors are nontrue.
+	if ($internal && ($self->{'_connect_retries'}++ >= $self->{'max_autoretry'})) {
+		$self->die('Could not connect to servers after ' . $self->{'max_autoretry'} . ' attempts.');
 	}
+	$self->connect();
 }
 
 sub connect {
@@ -96,7 +122,7 @@ sub connect {
 
 	my $ret = connect($sock, $sin);
 
-	if (!$ret && $self->{'connect_timeout'} && $!==EINPROGRESS) {
+	if (!$ret && $self->{'connect_timeout'} && $! == EINPROGRESS) {
 
 		my $win='';
 		vec($win, fileno($sock), 1) = 1;
@@ -122,9 +148,12 @@ sub connect {
 
 	$self->{'sock'} = $sock;
 
+	$self->next_server(1) unless $ret;
+
 	return $ret;
 }
 
+# based upon _write_and_read() found in Cache::Memcached
 sub _write_and_read_data {
 	my ($self, $line, $check_header) = @_;
 	my $sock = $self->{'sock'};
@@ -132,7 +161,13 @@ sub _write_and_read_data {
 	my @return;
 
 	# default: stats handler
-	$check_header ||= sub { if (m/OK (\d+)/) { return $1; } else { return 0; } };
+	$check_header ||= sub {
+		if (m/OK (\d+)/) {
+			return $1;
+		} else {
+			return 0;
+		}
+	};
 
 	# state: 0 - writing, 1 - reading header, 2 - reading data, 3 - done
 	my $state = 0; # writing 
@@ -295,31 +330,50 @@ sub _write_and_read {
 	return $ret;
 }
 
+sub handle_errors ($$$@) {
+	my ($self, $message, $command, @args) = @_;
+
+	# Try next server if possible
+	if ($message =~ m/DRAINING/i) {
+		$self->next_server(1);
+		shift @args;
+		return $self->$command(@args);
+	}
+	return undef;
+}
+
 sub put {
-	my ($self, $data, $pri, $delay) = @_;
+        my ($self, $data, $pri, $delay, $ttr) = @_;
 
 	$pri ||= 4294967295;
 	$pri %= 2**32;
 	$delay ||= 0;
 	$delay = int($delay);
+        $ttr = defined $ttr ? int($ttr) : 120;
 
-	my $ret = $self->_write_and_read("put $pri $delay " . length($data) . "\r\n$data\r\n");
+	my $ret = $self->_write_and_read("put $pri $delay $ttr " . length($data) . "\r\n$data\r\n");
 
 	return undef unless defined $ret;
 
 	$self->next_server if $self->{'auto_next_server'};
 
-	return 'inserted' if $ret =~ m/INSERTED/;
+        if ($ret =~ m/INSERTED (\d+)/) {
+                $self->{'last_insert_id'} = $1;
+                return 'inserted';
+        }
 	return 'buried' if $ret =~ m/BURIED/;
 
-	croak('Invalid data returned from server');
+	
+
+	$self->warn('Invalid data returned from server') unless $self->handle_errors($ret,'put',@_);
 	return undef;
 }
 
 sub stats {
 	my $self = shift;
+	my $id = defined $_[0] ? ' ' . int(shift()) : '';
 
-	my ($data, $bytes) = $self->_write_and_read_data("stats\r\n", sub {
+	my ($data, $bytes) = $self->_write_and_read_data("stats$id\r\n", sub {
 		if ($_[0] =~ m/ok (\d+)/i) {
 			return ($1);
 		} else {
@@ -327,8 +381,13 @@ sub stats {
 		}
 	});
 
-	# TODO: deyamlify first
-	return $data;
+	my $result = eval "use YAML; return 1;";
+	if ($result) {
+		return YAML::Load($data);
+	} else {
+		$self->warn('YAML module missing');
+		return $data;
+	}
 }
 
 sub reserve {
@@ -370,7 +429,10 @@ sub reserve {
 sub release {
 	my ($self, $pri, $delay) = @_;
 
-	croak 'no job reserved yet' unless $self->{'job_id'};
+	if ($self->{'job_id'}) {
+		$self->warn('no job reserved yet');
+		return undef;
+	}
 	my $res = $self->_write_and_read("release " .
 		$self->{'job_id'} . " " .
 		( ($pri % 2**32) || $self->{'job_pri'} ) . " " . # priority
@@ -394,7 +456,11 @@ sub release {
 sub delete {
 	my $self = shift;
 
-	croak 'no job reserved yet' unless $self->{'job_id'};
+	if (!defined $self->{'job_id'} || !$self->{'job_id'}) {
+		$self->warn('no job reserved yet');
+		return undef;
+	}
+
 	my $res = $self->_write_and_read("delete " . $self->{'job_id'} . "\r\n");
 
 	if ($res =~ m/DELETED/) {
@@ -459,7 +525,7 @@ Worker example:
     sleep(1); # prevent cpu intensive loop (just in case)
   }
 
-B<WARNING!> This module is marked as being in the alpha stage, and is therefore subject to change in near future.
+B<WARNING!> This module is marked as being in the alpha stage, and is therefore subject to change in near future. This version of Queue::Beanstalk currently supports the 0.6 protocol version of Beanstalkd.
 
 =head1 DESCRIPTION
 

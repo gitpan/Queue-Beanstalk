@@ -1,4 +1,4 @@
-Queue-Beanstalk version 0.01
+Queue-Beanstalk version 0.02
 ============================
 
 Client library for the beanstalkd daemon by Keith Rarick.
@@ -23,7 +23,7 @@ To install this module type the following:
 
 COPYRIGHT AND LICENCE
 
-Copyright (C) 2007 by Loopback Systems AS
+Copyright (C) 2008 by Loopback Systems AS
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.8.8 or,

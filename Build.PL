@@ -6,7 +6,7 @@ my $build = Module::Build->new
    dist_abstract => 'Client library for the beanstalkd server',
    dist_author => [ 'Håkon Nessjøen, Loopback Systems AS, E<lt>lunatic@cpan.orgE<gt>' ],
    requires => {
-		'perl'	=> '5.8.8',
+		'perl'	=> '5.6.0',
 		'Carp'	=> 0,
 		'IO::Handle' => 0,
 		},

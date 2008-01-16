@@ -1,6 +1,6 @@
 ---
 name: Queue-Beanstalk
-version: 0.01
+version: 0.02
 author:
   - 'Håkon Nessjøen, Loopback Systems AS, E<lt>lunatic@cpan.orgE<gt>'
 abstract: Client library for the beanstalkd server
@@ -10,11 +10,11 @@ resources:
 requires:
   Carp: 0
   IO::Handle: 0
-  perl: 5.8.8
+  perl: 5.6.0
 provides:
   Queue::Beanstalk:
     file: lib/Queue/Beanstalk.pm
-    version: 0.01
+    version: 0.02
 generated_by: Module::Build version 0.2808
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.2.html
